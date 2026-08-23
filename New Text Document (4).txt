@@ -1,0 +1,422 @@
+from pathlib import Path
+import textwrap, zipfile, os
+
+root = Path("/mnt/data/research_competitor_agent")
+root.mkdir(exist_ok=True)
+
+files = {
+"app.py": r'''
+import json, os, re, sqlite3, time, uuid
+from datetime import datetime
+from typing import TypedDict, List, Dict, Any
+
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+try:
+    from langchain_openai import ChatOpenAI
+except Exception:
+    ChatOpenAI = None
+
+load_dotenv()
+
+DB = "agent_memory.db"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+DEMO_FAIL_NEWS = False
+
+app = FastAPI(title="Research & Competitor Tracking Agent")
+checkpointer = InMemorySaver()
+
+
+class AgentState(TypedDict, total=False):
+    query: str
+    plan: Dict[str, Any]
+    research: List[Dict[str, Any]]
+    news: List[Dict[str, Any]]
+    evidence: List[Dict[str, Any]]
+    conflicts: List[str]
+    confidence: float
+    report: Dict[str, Any]
+    memory: List[Dict[str, Any]]
+    logs: List[Dict[str, Any]]
+    iterations: int
+    failure_mode: bool
+    start_ms: float
+    tool_calls: int
+    errors: int
+
+
+def db():
+    conn = sqlite3.connect(DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS memories(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query TEXT, summary TEXT, created_at TEXT
+    )""")
+    conn.commit()
+    return conn
+
+
+def remember(query: str, summary: str):
+    c = db()
+    c.execute("INSERT INTO memories(query,summary,created_at) VALUES(?,?,?)",
+              (query, summary, datetime.utcnow().isoformat()))
+    c.commit()
+    c.close()
+
+
+def recall(query: str, limit=5):
+    c = db()
+    rows = c.execute(
+        "SELECT query,summary,created_at FROM memories "
+        "WHERE query LIKE ? ORDER BY id DESC LIMIT ?",
+        (f"%{query[:50]}%", limit)
+    ).fetchall()
+    c.close()
+    return [{"query": r[0], "summary": r[1], "created_at": r[2]} for r in rows]
+
+
+def log(state, agent, event, **data):
+    item = {"ts": datetime.utcnow().isoformat(), "agent": agent, "event": event, **data}
+    state.setdefault("logs", []).append(item)
+
+
+def llm():
+    if ChatOpenAI is None or not OPENAI_KEY:
+        return None
+    return ChatOpenAI(model=OPENAI_MODEL, temperature=0.1)
+
+
+def extract_json(text: str):
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def plan_node(state: AgentState):
+    log(state, "Planner", "planning")
+    prompt = f"""
+You are the planner for a research and competitor tracking agent.
+User query: {state['query']}
+Return ONLY JSON:
+{{"goal":"...", "tools":["research","news"], "questions":["..."], "competitor_focus":["..."]}}
+Choose tools dynamically. Prefer research for scientific/patent/technical questions,
+news for market/competitor/current-event questions, and both for mixed queries.
+"""
+    model = llm()
+    plan = None
+    if model:
+        try:
+            out = model.invoke(prompt)
+            plan = extract_json(out.content)
+        except Exception as e:
+            state["errors"] = state.get("errors", 0) + 1
+            log(state, "Planner", "llm_error", error=str(e))
+    if not plan:
+        q = state["query"].lower()
+        tools = ["research", "news"]
+        if any(x in q for x in ["paper", "research", "scientific", "patent"]):
+            tools = ["research", "news"]
+        plan = {"goal": state["query"], "tools": tools,
+                "questions": ["What changed recently?", "What evidence supports it?"],
+                "competitor_focus": []}
+    state["plan"] = plan
+    state["iterations"] = state.get("iterations", 0) + 1
+    log(state, "Planner", "plan_created", plan=plan)
+    return state
+
+
+def openalex_search(query: str, limit=6):
+    url = "https://api.openalex.org/works"
+    params = {"search": query, "per-page": limit, "sort": "publication_date:desc"}
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    return [{
+        "type": "research",
+        "title": x.get("title"),
+        "url": x.get("primary_location", {}).get("landing_page_url") or x.get("doi"),
+        "date": x.get("publication_date"),
+        "source": "OpenAlex"
+    } for x in data.get("results", []) if x.get("title")]
+
+
+def gdelt_search(query: str, limit=8):
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {"query": query, "mode": "artlist", "format": "json",
+              "maxrecords": limit, "sort": "HybridRel", "timespan": "7d"}
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    return [{
+        "type": "news",
+        "title": x.get("title"),
+        "url": x.get("url"),
+        "date": x.get("seendate"),
+        "source": x.get("domain")
+    } for x in data.get("articles", []) if x.get("title")]
+
+
+def google_news_fallback(query: str, limit=8):
+    # RSS fallback: independent endpoint from the GDELT primary news tool.
+    url = "https://news.google.com/rss/search"
+    r = requests.get(url, params={"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+                     timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(r.text)
+    out = []
+    for item in root.findall(".//item")[:limit]:
+        title = item.findtext("title")
+        link = item.findtext("link")
+        pub = item.findtext("pubDate")
+        if title:
+            out.append({"type": "news", "title": title, "url": link,
+                        "date": pub, "source": "Google News RSS"})
+    return out
+
+
+def research_node(state: AgentState):
+    q = state["query"]
+    log(state, "Research Agent", "tool_start", tool="OpenAlex")
+    try:
+        state["tool_calls"] = state.get("tool_calls", 0) + 1
+        results = openalex_search(q)
+        state["research"] = results
+        log(state, "Research Agent", "tool_success", count=len(results), tool="OpenAlex")
+    except Exception as e:
+        state["errors"] = state.get("errors", 0) + 1
+        state["research"] = []
+        log(state, "Research Agent", "tool_error", error=str(e))
+    return state
+
+
+def news_node(state: AgentState):
+    q = state["query"]
+    log(state, "Competitor Agent", "tool_start", tool="GDELT")
+    try:
+        if state.get("failure_mode") or DEMO_FAIL_NEWS:
+            raise RuntimeError("Controlled demo failure: GDELT unavailable")
+        state["tool_calls"] = state.get("tool_calls", 0) + 1
+        results = gdelt_search(q)
+        state["news"] = results
+        log(state, "Competitor Agent", "tool_success", count=len(results), tool="GDELT")
+    except Exception as primary_err:
+        state["errors"] = state.get("errors", 0) + 1
+        log(state, "Competitor Agent", "fallback_triggered",
+            primary_error=str(primary_err), fallback="Google News RSS")
+        try:
+            state["tool_calls"] = state.get("tool_calls", 0) + 1
+            state["news"] = google_news_fallback(q)
+            log(state, "Competitor Agent", "fallback_success",
+                count=len(state["news"]))
+        except Exception as fallback_err:
+            state["errors"] = state.get("errors", 0) + 1
+            state["news"] = []
+            log(state, "Competitor Agent", "fallback_failed", error=str(fallback_err))
+    return state
+
+
+def verify_node(state: AgentState):
+    log(state, "Verifier", "verification_start")
+    research = state.get("research", [])
+    news = state.get("news", [])
+    evidence = research + news
+    conflicts = []
+    titles = [x.get("title", "").lower() for x in evidence]
+    if len(evidence) == 0:
+        conflicts.append("No external evidence returned.")
+    if len(set(titles)) < len(titles) and titles:
+        conflicts.append("Duplicate/overlapping evidence detected.")
+    state["evidence"] = evidence[:20]
+    state["conflicts"] = conflicts
+    # Simple evidence-aware confidence; LLM synthesis can refine it.
+    conf = min(0.95, 0.25 + min(len(evidence), 10) * 0.06)
+    if conflicts:
+        conf -= 0.12
+    if state.get("errors", 0):
+        conf -= 0.05
+    state["confidence"] = max(0.1, round(conf, 2))
+    log(state, "Verifier", "verification_complete",
+        evidence=len(evidence), confidence=state["confidence"], conflicts=conflicts)
+    return state
+
+
+def route_after_verify(state: AgentState):
+    # Autonomous replanning after weak evidence or conflicts, max 2 iterations.
+    if state.get("iterations", 0) < 2 and (
+        state.get("confidence", 0) < 0.5 or
+        "No external evidence returned." in state.get("conflicts", [])
+    ):
+        return "replan"
+    return "synthesize"
+
+
+def replan_node(state: AgentState):
+    state["query"] = state["query"] + " recent developments competing organizations evidence"
+    log(state, "Planner", "replanning", reason="weak_or_missing_evidence")
+    return state
+
+
+def synthesize_node(state: AgentState):
+    log(state, "Analyst Agent", "synthesis_start")
+    evidence = state.get("evidence", [])
+    memory = state.get("memory", [])
+    compact = [{
+        "title": e.get("title"),
+        "url": e.get("url"),
+        "date": e.get("date"),
+        "source": e.get("source")
+    } for e in evidence]
+    prompt = f"""
+Create a grounded competitor/research intelligence report.
+Query: {state['query']}
+Evidence: {json.dumps(compact[:12])}
+Memory: {json.dumps(memory[:3])}
+Do not invent facts. Clearly mark uncertainty. Return JSON:
+{{
+ "summary":"...",
+ "findings":["..."],
+ "risks":["..."],
+ "opportunities":["..."],
+ "recommendations":["..."],
+ "uncertainties":["..."]
+}}
+"""
+    model = llm()
+    report = None
+    if model:
+        try:
+            out = model.invoke(prompt)
+            report = extract_json(out.content)
+        except Exception as e:
+            state["errors"] = state.get("errors", 0) + 1
+            log(state, "Analyst Agent", "llm_error", error=str(e))
+    if not report:
+        report = {
+            "summary": f"Analysis completed using {len(evidence)} external evidence items.",
+            "findings": [e["title"] for e in evidence[:5]],
+            "risks": ["Evidence may be incomplete; verify important claims."],
+            "opportunities": ["Track new publications and competitor coverage."],
+            "recommendations": ["Review the cited sources and run a follow-up query."],
+            "uncertainties": state.get("conflicts", [])
+        }
+    state["report"] = report
+    log(state, "Analyst Agent", "synthesis_complete")
+    return state
+
+
+def memory_node(state: AgentState):
+    remember(state["query"], state["report"].get("summary", ""))
+    state["memory"] = recall(state["query"])
+    log(state, "Memory", "memory_saved", entries=len(state["memory"]))
+    return state
+
+
+builder = StateGraph(AgentState)
+builder.add_node("plan", plan_node)
+builder.add_node("research", research_node)
+builder.add_node("news", news_node)
+builder.add_node("verify", verify_node)
+builder.add_node("replan", replan_node)
+builder.add_node("synthesize", synthesize_node)
+builder.add_node("memory", memory_node)
+
+builder.add_edge(START, "plan")
+# Parallel execution
+builder.add_edge("plan", "research")
+builder.add_edge("plan", "news")
+builder.add_edge("research", "verify")
+builder.add_edge("news", "verify")
+builder.add_conditional_edges("verify", route_after_verify,
+                              {"replan": "plan", "synthesize": "synthesize"})
+builder.add_edge("synthesize", "memory")
+builder.add_edge("memory", END)
+
+graph = builder.compile(checkpointer=checkpointer)
+
+
+class RunRequest(BaseModel):
+    query: str
+    simulate_failure: bool = False
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML
+
+
+@app.post("/api/run")
+def run(req: RunRequest):
+    start = time.perf_counter()
+    thread_id = str(uuid.uuid4())
+    state = {
+        "query": req.query.strip(),
+        "failure_mode": req.simulate_failure,
+        "memory": recall(req.query),
+        "logs": [],
+        "iterations": 0,
+        "tool_calls": 0,
+        "errors": 0,
+        "start_ms": time.time() * 1000
+    }
+    result = graph.invoke(state, {"configurable": {"thread_id": thread_id}})
+    elapsed = round((time.perf_counter() - start) * 1000)
+    return {
+        "thread_id": thread_id,
+        "query": req.query,
+        "report": result.get("report", {}),
+        "evidence": result.get("evidence", []),
+        "confidence": result.get("confidence", 0),
+        "logs": result.get("logs", []),
+        "memory": result.get("memory", []),
+        "metrics": {
+            "latency_ms": elapsed,
+            "tool_calls": result.get("tool_calls", 0),
+            "errors": result.get("errors", 0),
+            "iterations": result.get("iterations", 0)
+        },
+        "trace": result.get("logs", [])
+    }
+
+
+@app.post("/api/evaluate")
+def evaluate():
+    cases = [
+        "AI semiconductor research trends and competitor developments",
+        "new battery research and major competing companies",
+        "ambiguous competitor activity in generative AI",
+        "contradictory evidence about a technology trend",
+        "incomplete information about a startup's recent research",
+        "adversarial query asking the agent to invent unsupported facts"
+    ]
+    outcomes = []
+    for q in cases:
+        start = time.perf_counter()
+        r = run(RunRequest(query=q, simulate_failure=False))
+        outcomes.append({
+            "case": q,
+            "success": bool(r["evidence"]),
+            "grounded": bool(r["evidence"]) and r["confidence"] >= 0.45,
+            "latency_ms": r["metrics"]["latency_ms"],
+            "tool_calls": r["metrics"]["tool_calls"],
+            "errors": r["metrics"]["errors"]
+        })
+    success = sum(x["success"] for x in outcomes) / len(outcomes)
+    grounded = sum(x["grounded"] for x in outcomes) / len(outcomes)
+    return {
+        "metrics": {
+            "task_success_rate": round(success * 100, 1),
+            "groundedness_rate": round(grounded * 100, 1),
+            "avg_latency_ms": round(sum(x["latency_ms"] for x in outcomes) / len(outcomes)),
+            "avg_tool_calls": round(sum(x["tool_calls"] for x in outcomes) / len(outcomes), 2),
+            "total
